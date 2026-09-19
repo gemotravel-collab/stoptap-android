@@ -97,8 +97,7 @@ jobs:
           (a/"index.html").write_text(h)
 
           print("Bundled",len(s),"stops")
-          PY
-                - name: Make app load bundled control centre
+          PY      - name: Make app load bundled control centre
         run: |
           python - <<'PY'
           import os
