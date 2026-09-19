@@ -1,0 +1,713 @@
+name: STOP TAP v5.6 TRIP NOW
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/stoptap-v56-trip-now.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Android SDK
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          fi
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Prepare source and Adelaide Metro data
+        run: |
+          rm -rf build-src
+          mkdir build-src
+          unzip -q stoptap_android_v5_alpha_source.zip -d build-src
+          PROJECT_DIR="$(find build-src -maxdepth 2 -name settings.gradle -printf '%h\n' | head -n 1)"
+          test -n "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          curl --fail --location --retry 3 --retry-delay 2             --user-agent "StopTap Android prototype"             "https://gtfs.adelaidemetro.com.au/v1/static/latest/google_transit.zip"             --output /tmp/google_transit.zip
+
+          test -s /tmp/google_transit.zip
+          unzip -t /tmp/google_transit.zip >/dev/null
+
+      - name: Bundle local Adelaide Metro stop database
+        run: |
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+          html = (root / "web_v43" / "index.html").read_text()
+
+          with zipfile.ZipFile("/tmp/google_transit.zip") as z:
+              stops_text = z.read("stops.txt").decode("utf-8-sig")
+
+          stops = []
+          for row in csv.DictReader(io.StringIO(stops_text)):
+              code = (row.get("stop_code") or "").strip()
+              if not code:
+                  continue
+
+              try:
+                  lat = float(row["stop_lat"])
+                  lon = float(row["stop_lon"])
+              except (KeyError, TypeError, ValueError):
+                  continue
+
+              stops.append({
+                  "id": (row.get("stop_id") or code).strip(),
+                  "code": code,
+                  "name": (row.get("stop_name") or "Adelaide Metro stop").strip(),
+                  "lat": round(lat, 6),
+                  "lon": round(lon, 6)
+              })
+
+          if len(stops) < 5000:
+              raise SystemExit("Stop database unexpectedly small: " + str(len(stops)))
+
+          codes = {s["code"] for s in stops}
+          for required in ("17978", "12828"):
+              if required not in codes:
+                  raise SystemExit("Known test stop missing: " + required)
+
+          html = html.replace('<script src="./jszip.min.js"></script>', '')
+          html = html.replace(
+              "const PHOTON='/photon';",
+              "const PHOTON='https://photon.komoot.io';"
+          )
+          html = html.replace(
+              "v4.3 · native-widget bridge",
+              "v5.6 · trip now"
+          )
+          # Hide StopTap's own startup location sheet. Android still asks only when permission is actually needed.
+          html = html.replace(
+              '<div id="locationSheet" class="overlay">',
+              '<div id="locationSheet" class="overlay hide">'
+          )
+          html = html.replace(
+              "const p=$('#permissionStatus');if(!window.isSecureContext)",
+              "const p=$('#locationSheet').classList.contains('hide')?$('#searchStatus'):$('#permissionStatus');if(!window.isSecureContext)"
+          )
+
+          snapshot = datetime.now(timezone.utc).strftime("%d %b %Y")
+
+          data_script = (
+              "<script>\n"
+              + "window.STOPTAP_STOPS="
+              + json.dumps(stops, ensure_ascii=False, separators=(",", ":"))
+              + ";\n"
+              + "window.STOPTAP_STOP_SNAPSHOT="
+              + json.dumps(snapshot)
+              + ";\n"
+              + "</script>\n"
+          )
+
+          marker = "<script>\nconst $=s=>document.querySelector(s);"
+          if marker not in html:
+              raise SystemExit("StopTap main script marker not found")
+
+          html = html.replace(marker, data_script + marker, 1)
+
+          start = html.find("async function loadStops(){")
+          end = html.find("\nfunction exactStop", start)
+
+          if start < 0 or end < 0:
+              raise SystemExit("loadStops() was not found")
+
+          new_loader = '''async function loadStops(){
+          if(state.stops)return state.stops;
+          const out=Array.isArray(window.STOPTAP_STOPS)?window.STOPTAP_STOPS:[];
+          if(out.length<5000)throw new Error('Bundled stop database is incomplete ('+out.length+' stops).');
+          state.stops=out;
+          return out;
+          }'''
+
+          html = html[:start] + new_loader + html[end:]
+
+          html = html.replace(
+              "`Metro data ready (${st.length.toLocaleString()} stops). Test codes verified: #17978 and #12828. Search radius: 1 km.`",
+              "`Stop database ready (${st.length.toLocaleString()} stops; snapshot ${window.STOPTAP_STOP_SNAPSHOT}). Test codes verified: #17978 and #12828. Search radius: 1 km.`"
+          )
+
+          html = html.replace(
+              "Stop locations and 5-digit codes come from Adelaide Metro's official GTFS feed. This build uses a same-site Netlify proxy so the browser can actually download that feed. Nearby-stop search covers up to 1 km.",
+              "Stop locations and 5-digit codes are bundled from Adelaide Metro's official GTFS feed. Nearby-stop search uses the local database and covers up to 1 km."
+          )
+
+          assets = root / "app" / "src" / "main" / "assets"
+          assets.mkdir(parents=True, exist_ok=True)
+          (assets / "index.html").write_text(html)
+
+          print("Bundled", len(stops), "Adelaide Metro stops; snapshot", snapshot)
+          PY
+
+      - name: Load the bundled control centre inside Android
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+          path = root / "app" / "src" / "main" / "java" / "au" / "com" / "stoptap" / "app" / "MainActivity.java"
+          text = path.read_text()
+
+          if "import java.io.BufferedReader;" not in text:
+              text = text.replace(
+                  "import android.app.Activity;",
+                  "import android.app.Activity;\n\nimport java.io.BufferedReader;\nimport java.io.InputStreamReader;"
+              )
+
+          old = '        webView.loadUrl(getString(R.string.control_centre_url));'
+
+          new = '''        try {
+            StringBuilder html = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(getAssets().open("index.html")))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    html.append(line).append("\\n");
+                }
+            }
+            String baseUrl = getString(R.string.control_centre_url);
+            if (!baseUrl.endsWith("/")) baseUrl += "/";
+            webView.loadDataWithBaseURL(
+                    baseUrl,
+                    html.toString(),
+                    "text/html",
+                    "UTF-8",
+                    null
+            );
+          } catch (Exception e) {
+            Toast.makeText(
+                    this,
+                    "Could not load StopTap control centre.",
+                    Toast.LENGTH_LONG
+            ).show();
+          }'''
+
+          if old not in text:
+              raise SystemExit("Original WebView load line was not found")
+
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          sed -i "s/versionCode 1/versionCode 6/" "$PROJECT_DIR/app/build.gradle"
+          sed -i "s/versionName '5.0-alpha'/versionName '5.6-alpha'/" "$PROJECT_DIR/app/build.gradle"
+
+      - name: Fix Samsung widget pinning and make it 1x1
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+
+          manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+          m = manifest.read_text()
+          m = m.replace(
+              '<receiver\n            android:name=".StopTapWidget"\n            android:exported="false">',
+              '<receiver\n            android:name=".StopTapWidget"\n            android:exported="true">'
+          )
+          manifest.write_text(m)
+
+          info = root / "app" / "src" / "main" / "res" / "xml" / "stoptap_widget_info.xml"
+          info.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="40dp"
+              android:minHeight="40dp"
+              android:minResizeWidth="40dp"
+              android:minResizeHeight="40dp"
+              android:maxResizeWidth="180dp"
+              android:maxResizeHeight="180dp"
+              android:targetCellWidth="1"
+              android:targetCellHeight="1"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/stoptap_widget"
+              android:previewLayout="@layout/stoptap_widget"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"
+              android:description="@string/app_name" />
+          """)
+
+          layout = root / "app" / "src" / "main" / "res" / "layout" / "stoptap_widget.xml"
+          layout.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:gravity="center"
+              android:padding="5dp"
+              android:background="@drawable/widget_bg">
+
+              <TextView
+                  android:id="@+id/route_name"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center"
+                  android:maxLines="2"
+                  android:ellipsize="end"
+                  android:text="StopTap"
+                  android:textColor="@color/st_ink"
+                  android:textStyle="bold"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/widget_status"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="2dp"
+                  android:gravity="center"
+                  android:maxLines="1"
+                  android:text="Tap"
+                  android:textColor="@color/st_muted"
+                  android:textSize="9sp" />
+
+              <TextView android:id="@+id/from_stop" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+              <TextView android:id="@+id/to_stop" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+              <TextView android:id="@+id/refresh_button" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+              <TextView android:id="@+id/open_button" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+          </LinearLayout>
+          """)
+
+          widget = root / "app" / "src" / "main" / "java" / "au" / "com" / "stoptap" / "app" / "StopTapWidget.java"
+          w = widget.read_text()
+          w = w.replace(
+              'views.setTextViewText(R.id.widget_status, "Updated " + stamp + " · live arrivals next build");',
+              'views.setTextViewText(R.id.widget_status, "Tap · " + stamp);'
+          )
+          old = '        views.setOnClickPendingIntent(R.id.open_button, openPi);'
+          new = (
+              '        views.setOnClickPendingIntent(R.id.open_button, openPi);\n'
+              '        views.setOnClickPendingIntent(R.id.widget_root, openPi);\n'
+              '        views.setOnClickPendingIntent(R.id.route_name, openPi);'
+          )
+          if old not in w:
+              raise SystemExit("Could not patch widget click target")
+          widget.write_text(w.replace(old, new, 1))
+
+          if 'android:exported="true"' not in manifest.read_text():
+              raise SystemExit("Widget provider was not exported")
+
+          print("Widget provider exported and compact 1x1 layout installed.")
+          PY
+
+      - name: Add Trip Now screen and route widget there
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+
+          manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+          m = manifest.read_text()
+          activity = '''        <activity
+              android:name=".TripNowActivity"
+              android:exported="false" />
+          '''
+          if '.TripNowActivity' not in m:
+              m = m.replace('        <receiver\n            android:name=".StopTapWidget"', activity + '\n        <receiver\n            android:name=".StopTapWidget"', 1)
+          manifest.write_text(m)
+
+          layout = root / "app" / "src" / "main" / "res" / "layout" / "activity_trip_now.xml"
+          layout.write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/st_bg"
+              android:fillViewport="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="TRIP NOW"
+                      android:textColor="@color/st_mint"
+                      android:textStyle="bold"
+                      android:textSize="14sp" />
+
+                  <TextView
+                      android:id="@+id/trip_route_name"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Saved route"
+                      android:textColor="@color/st_ink"
+                      android:textStyle="bold"
+                      android:textSize="30sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="22dp"
+                      android:orientation="vertical"
+                      android:padding="18dp"
+                      android:background="@drawable/widget_bg">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="START STOP"
+                          android:textColor="@color/st_muted"
+                          android:textStyle="bold"
+                          android:textSize="12sp" />
+
+                      <TextView
+                          android:id="@+id/trip_stop"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="StopTap stop"
+                          android:textColor="@color/st_ink"
+                          android:textStyle="bold"
+                          android:textSize="19sp" />
+
+                      <TextView
+                          android:id="@+id/trip_distance"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="14dp"
+                          android:text="Finding your location…"
+                          android:textColor="@color/st_muted"
+                          android:textSize="16sp" />
+
+                      <TextView
+                          android:id="@+id/trip_walk"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="5dp"
+                          android:text="Walk: —"
+                          android:textColor="@color/st_mint"
+                          android:textStyle="bold"
+                          android:textSize="22sp" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="14dp"
+                      android:orientation="vertical"
+                      android:padding="18dp"
+                      android:background="@drawable/widget_bg">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="NEXT BUSES"
+                          android:textColor="@color/st_muted"
+                          android:textStyle="bold"
+                          android:textSize="12sp" />
+
+                      <TextView
+                          android:id="@+id/trip_status"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="8dp"
+                          android:text="Live arrival countdown is the next StopTap build."
+                          android:textColor="@color/st_ink"
+                          android:textSize="17sp" />
+                  </LinearLayout>
+
+                  <Button
+                      android:id="@+id/live_stop_button"
+                      android:layout_width="match_parent"
+                      android:layout_height="56dp"
+                      android:layout_marginTop="18dp"
+                      android:text="OPEN LIVE STOP"
+                      android:textStyle="bold"
+                      android:textSize="16sp"
+                      android:textColor="#091017"
+                      android:background="@drawable/mint_button" />
+
+                  <Button
+                      android:id="@+id/edit_route_button"
+                      android:layout_width="match_parent"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="10dp"
+                      android:text="EDIT ROUTE"
+                      android:textStyle="bold"
+                      android:textSize="15sp"
+                      android:textColor="@color/st_ink"
+                      android:background="@drawable/dark_button" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="18dp"
+                      android:text="Walking time is an estimate from your current position to the selected stop."
+                      android:textColor="@color/st_muted"
+                      android:textSize="12sp" />
+              </LinearLayout>
+          </ScrollView>
+          ''')
+
+          java_dir = root / "app" / "src" / "main" / "java" / "au" / "com" / "stoptap" / "app"
+
+          (java_dir / "StopTapWidget.java").write_text(r'''package au.com.stoptap.app;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.widget.RemoteViews;
+
+          import org.json.JSONObject;
+
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          public class StopTapWidget extends AppWidgetProvider {
+              public static final String ACTION_REFRESH = "au.com.stoptap.app.REFRESH_WIDGET";
+
+              @Override
+              public void onUpdate(Context context, AppWidgetManager manager, int[] ids) {
+                  for (int id : ids) updateOne(context, manager, id);
+              }
+
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  super.onReceive(context, intent);
+                  if (ACTION_REFRESH.equals(intent.getAction())) {
+                      int id = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID);
+                      if (id != AppWidgetManager.INVALID_APPWIDGET_ID) updateOne(context, AppWidgetManager.getInstance(context), id);
+                  }
+              }
+
+              static void updateOne(Context context, AppWidgetManager manager, int widgetId) {
+                  String json = context.getSharedPreferences("stoptap", Context.MODE_PRIVATE)
+                          .getString("widget_route_" + widgetId, null);
+                  if (json == null) json = context.getSharedPreferences("stoptap", Context.MODE_PRIVATE)
+                          .getString("latest_route", null);
+
+                  String routeName = "StopTap";
+                  if (json != null) {
+                      try { routeName = new JSONObject(json).optString("name", routeName); }
+                      catch (Exception ignored) {}
+                  }
+
+                  RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.stoptap_widget);
+                  views.setTextViewText(R.id.route_name, routeName);
+                  String stamp = new SimpleDateFormat("h:mm", Locale.getDefault()).format(new Date());
+                  views.setTextViewText(R.id.widget_status, "Trip now · " + stamp);
+
+                  Intent open = new Intent(context, TripNowActivity.class);
+                  open.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
+                  open.setData(Uri.parse("stoptap://trip/" + widgetId));
+                  PendingIntent openPi = PendingIntent.getActivity(context, widgetId + 10000, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                  views.setOnClickPendingIntent(R.id.widget_root, openPi);
+                  views.setOnClickPendingIntent(R.id.route_name, openPi);
+                  views.setOnClickPendingIntent(R.id.widget_status, openPi);
+                  views.setOnClickPendingIntent(R.id.open_button, openPi);
+                  manager.updateAppWidget(widgetId, views);
+              }
+          }
+          ''')
+
+          (java_dir / "TripNowActivity.java").write_text(r'''package au.com.stoptap.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.appwidget.AppWidgetManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.location.Location;
+          import android.location.LocationManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.TextView;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class TripNowActivity extends Activity {
+              private static final int LOCATION_REQ = 2002;
+              private int widgetId = AppWidgetManager.INVALID_APPWIDGET_ID;
+              private double stopLat = Double.NaN;
+              private double stopLon = Double.NaN;
+              private String stopCode = "";
+              private TextView distanceView;
+              private TextView walkView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_trip_now);
+
+                  widgetId = getIntent().getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID);
+                  TextView routeView = findViewById(R.id.trip_route_name);
+                  TextView stopView = findViewById(R.id.trip_stop);
+                  distanceView = findViewById(R.id.trip_distance);
+                  walkView = findViewById(R.id.trip_walk);
+                  Button liveButton = findViewById(R.id.live_stop_button);
+                  Button editButton = findViewById(R.id.edit_route_button);
+
+                  String json = getSharedPreferences("stoptap", Context.MODE_PRIVATE)
+                          .getString("widget_route_" + widgetId, null);
+                  if (json == null) json = getSharedPreferences("stoptap", Context.MODE_PRIVATE)
+                          .getString("latest_route", null);
+
+                  String routeName = "Saved route";
+                  String stopName = "No saved start stop";
+                  if (json != null) {
+                      try {
+                          JSONObject route = new JSONObject(json);
+                          routeName = route.optString("name", routeName);
+                          JSONArray from = route.optJSONArray("from");
+                          if (from != null && from.length() > 0) {
+                              JSONObject stop = from.getJSONObject(0);
+                              stopName = stop.optString("name", "Start stop");
+                              stopCode = stop.optString("code", "");
+                              stopLat = stop.optDouble("lat", Double.NaN);
+                              stopLon = stop.optDouble("lon", Double.NaN);
+                              if (!stopCode.isEmpty()) stopName += "  #" + stopCode;
+                          }
+                      } catch (Exception ignored) {}
+                  }
+
+                  routeView.setText(routeName);
+                  stopView.setText(stopName);
+                  liveButton.setEnabled(!stopCode.isEmpty());
+                  liveButton.setOnClickListener(v -> {
+                      if (!stopCode.isEmpty()) startActivity(new Intent(Intent.ACTION_VIEW,
+                              Uri.parse("https://www.adelaidemetro.com.au/stops?id=" + stopCode)));
+                  });
+                  editButton.setOnClickListener(v -> {
+                      startActivity(new Intent(this, MainActivity.class));
+                      finish();
+                  });
+                  updateWalkingDistance();
+              }
+
+              private boolean hasLocationPermission() {
+                  return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                          checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void updateWalkingDistance() {
+                  if (Double.isNaN(stopLat) || Double.isNaN(stopLon)) {
+                      distanceView.setText("No stop coordinates saved");
+                      walkView.setText("Walk: —");
+                      return;
+                  }
+                  if (!hasLocationPermission()) {
+                      distanceView.setText("Allow location once to calculate your walk");
+                      walkView.setText("Walk: —");
+                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, LOCATION_REQ);
+                      return;
+                  }
+
+                  distanceView.setText("Finding your current location…");
+                  walkView.setText("Walk: calculating…");
+                  try {
+                      LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+                      Location best = newest(safeLastKnown(lm, LocationManager.GPS_PROVIDER), safeLastKnown(lm, LocationManager.NETWORK_PROVIDER));
+                      best = newest(best, safeLastKnown(lm, LocationManager.PASSIVE_PROVIDER));
+                      if (best != null) showWalkingDistance(best);
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          String provider = lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                                  ? LocationManager.NETWORK_PROVIDER : LocationManager.GPS_PROVIDER;
+                          lm.getCurrentLocation(provider, null, getMainExecutor(), location -> {
+                              if (location != null) showWalkingDistance(location);
+                          });
+                      }
+                  } catch (Exception e) {
+                      distanceView.setText("Location is temporarily unavailable");
+                      walkView.setText("Walk: —");
+                  }
+              }
+
+              private Location safeLastKnown(LocationManager lm, String provider) {
+                  try {
+                      if (!lm.isProviderEnabled(provider)) return null;
+                      return lm.getLastKnownLocation(provider);
+                  } catch (Exception e) { return null; }
+              }
+
+              private Location newest(Location a, Location b) {
+                  if (a == null) return b;
+                  if (b == null) return a;
+                  return a.getTime() >= b.getTime() ? a : b;
+              }
+
+              private void showWalkingDistance(Location current) {
+                  float[] result = new float[1];
+                  Location.distanceBetween(current.getLatitude(), current.getLongitude(), stopLat, stopLon, result);
+                  int metres = Math.max(0, Math.round(result[0]));
+                  int minutes = Math.max(1, (int) Math.ceil(metres / 75.0));
+                  distanceView.setText(metres + " m from you");
+                  walkView.setText("Walk: about " + minutes + (minutes == 1 ? " min" : " mins"));
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == LOCATION_REQ) {
+                      if (hasLocationPermission()) updateWalkingDistance();
+                      else {
+                          distanceView.setText("Location not allowed — walking time hidden");
+                          walkView.setText("Walk: —");
+                      }
+                  }
+              }
+          }
+          ''')
+          print("Trip Now screen added. Widget taps now open only essential trip information.")
+          PY
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StopTap-v5.6-trip-now-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
