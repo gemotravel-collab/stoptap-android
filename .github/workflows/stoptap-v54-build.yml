@@ -1,0 +1,227 @@
+name: StopTap v5.4 Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Android SDK
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          fi
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Prepare source and Adelaide Metro data
+        run: |
+          rm -rf build-src
+          mkdir build-src
+          unzip -q stoptap_android_v5_alpha_source.zip -d build-src
+          PROJECT_DIR="$(find build-src -maxdepth 2 -name settings.gradle -printf '%h\n' | head -n 1)"
+          test -n "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          curl --fail --location --retry 3 --retry-delay 2             --user-agent "StopTap Android prototype"             "https://gtfs.adelaidemetro.com.au/v1/static/latest/google_transit.zip"             --output /tmp/google_transit.zip
+
+          test -s /tmp/google_transit.zip
+          unzip -t /tmp/google_transit.zip >/dev/null
+
+      - name: Bundle local Adelaide Metro stop database
+        run: |
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+          html = (root / "web_v43" / "index.html").read_text()
+
+          with zipfile.ZipFile("/tmp/google_transit.zip") as z:
+              stops_text = z.read("stops.txt").decode("utf-8-sig")
+
+          stops = []
+          for row in csv.DictReader(io.StringIO(stops_text)):
+              code = (row.get("stop_code") or "").strip()
+              if not code:
+                  continue
+
+              try:
+                  lat = float(row["stop_lat"])
+                  lon = float(row["stop_lon"])
+              except (KeyError, TypeError, ValueError):
+                  continue
+
+              stops.append({
+                  "id": (row.get("stop_id") or code).strip(),
+                  "code": code,
+                  "name": (row.get("stop_name") or "Adelaide Metro stop").strip(),
+                  "lat": round(lat, 6),
+                  "lon": round(lon, 6)
+              })
+
+          if len(stops) < 5000:
+              raise SystemExit("Stop database unexpectedly small: " + str(len(stops)))
+
+          codes = {s["code"] for s in stops}
+          for required in ("17978", "12828"):
+              if required not in codes:
+                  raise SystemExit("Known test stop missing: " + required)
+
+          html = html.replace('<script src="./jszip.min.js"></script>', '')
+          html = html.replace(
+              "const PHOTON='/photon';",
+              "const PHOTON='https://photon.komoot.io';"
+          )
+          html = html.replace(
+              "v4.3 · native-widget bridge",
+              "v5.4 · local stop database"
+          )
+
+          snapshot = datetime.now(timezone.utc).strftime("%d %b %Y")
+
+          data_script = (
+              "<script>\n"
+              + "window.STOPTAP_STOPS="
+              + json.dumps(stops, ensure_ascii=False, separators=(",", ":"))
+              + ";\n"
+              + "window.STOPTAP_STOP_SNAPSHOT="
+              + json.dumps(snapshot)
+              + ";\n"
+              + "</script>\n"
+          )
+
+          marker = "<script>\nconst $=s=>document.querySelector(s);"
+          if marker not in html:
+              raise SystemExit("StopTap main script marker not found")
+
+          html = html.replace(marker, data_script + marker, 1)
+
+          start = html.find("async function loadStops(){")
+          end = html.find("\nfunction exactStop", start)
+
+          if start < 0 or end < 0:
+              raise SystemExit("loadStops() was not found")
+
+          new_loader = '''async function loadStops(){
+ if(state.stops)return state.stops;
+ const out=Array.isArray(window.STOPTAP_STOPS)?window.STOPTAP_STOPS:[];
+ if(out.length<5000)throw new Error('Bundled stop database is incomplete ('+out.length+' stops).');
+ state.stops=out;
+ return out;
+}'''
+
+          html = html[:start] + new_loader + html[end:]
+
+          html = html.replace(
+              "`Metro data ready (${st.length.toLocaleString()} stops). Test codes verified: #17978 and #12828. Search radius: 1 km.`",
+              "`Stop database ready (${st.length.toLocaleString()} stops; snapshot ${window.STOPTAP_STOP_SNAPSHOT}). Test codes verified: #17978 and #12828. Search radius: 1 km.`"
+          )
+
+          html = html.replace(
+              "Stop locations and 5-digit codes come from Adelaide Metro's official GTFS feed. This build uses a same-site Netlify proxy so the browser can actually download that feed. Nearby-stop search covers up to 1 km.",
+              "Stop locations and 5-digit codes are bundled from Adelaide Metro's official GTFS feed. Nearby-stop search uses the local database and covers up to 1 km."
+          )
+
+          assets = root / "app" / "src" / "main" / "assets"
+          assets.mkdir(parents=True, exist_ok=True)
+          (assets / "index.html").write_text(html)
+
+          print("Bundled", len(stops), "Adelaide Metro stops; snapshot", snapshot)
+          PY
+
+      - name: Load the bundled control centre inside Android
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+          path = root / "app" / "src" / "main" / "java" / "au" / "com" / "stoptap" / "app" / "MainActivity.java"
+          text = path.read_text()
+
+          if "import java.io.BufferedReader;" not in text:
+              text = text.replace(
+                  "import android.app.Activity;",
+                  "import android.app.Activity;\n\nimport java.io.BufferedReader;\nimport java.io.InputStreamReader;"
+              )
+
+          old = '        webView.loadUrl(getString(R.string.control_centre_url));'
+
+          new = '''        try {
+            StringBuilder html = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(getAssets().open("index.html")))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    html.append(line).append("\\n");
+                }
+            }
+            String baseUrl = getString(R.string.control_centre_url);
+            if (!baseUrl.endsWith("/")) baseUrl += "/";
+            webView.loadDataWithBaseURL(
+                    baseUrl,
+                    html.toString(),
+                    "text/html",
+                    "UTF-8",
+                    null
+            );
+        } catch (Exception e) {
+            Toast.makeText(
+                    this,
+                    "Could not load StopTap control centre.",
+                    Toast.LENGTH_LONG
+            ).show();
+        }'''
+
+          if old not in text:
+              raise SystemExit("Original WebView load line was not found")
+
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          sed -i "s/versionCode 1/versionCode 4/" "$PROJECT_DIR/app/build.gradle"
+          sed -i "s/versionName '5.0-alpha'/versionName '5.4-alpha'/" "$PROJECT_DIR/app/build.gradle"
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StopTap-v5.4-local-stops-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
