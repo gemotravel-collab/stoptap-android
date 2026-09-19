@@ -52,6 +52,10 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "StopTap project found at: $PROJECT_DIR"
 
+      - name: Point app at current StopTap site
+        run: |
+          sed -i 's#<string name="control_centre_url">.*</string>#<string name="control_centre_url">https://dreamy-caramel-81066e.netlify.app</string>#' "$PROJECT_DIR/app/src/main/res/values/strings.xml"
+
       - name: Build debug APK
         run: |
           cd "$PROJECT_DIR"
@@ -60,6 +64,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: StopTap-v5-alpha-debug-apk
+          name: StopTap-v5.1-debug-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
