@@ -431,7 +431,7 @@ jobs:
 
           trip_now = java_dir / 'TripNowActivity.java'
           text = trip_now.read_text()
-          needle = '                  statusView.setText(out.toString());'
+          needle = 'statusView.setText(out.toString());'
           replacement = '''                  statusView.setText(out.toString());
 
                   if (widgetId != AppWidgetManager.INVALID_APPWIDGET_ID && !arrivals.isEmpty()) {
