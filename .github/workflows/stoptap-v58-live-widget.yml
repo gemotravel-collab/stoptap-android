@@ -186,7 +186,10 @@ jobs:
                   }
                   super.onReceive(context, intent);
               }
-
+    static void updateOne(Context context, AppWidgetManager manager, int widgetId) {
+        renderCached(context, manager, widgetId);
+        requestRefresh(context, widgetId);
+    }
               private static void scheduleTicks(Context context) {
                   AlarmManager alarm = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
                   if (alarm == null) return;
