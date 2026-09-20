@@ -1,0 +1,468 @@
+name: STOP TAP v5.8 LIVE WIDGET
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/stoptap-v58-live-widget.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Replay the known-good v5.7.1 build preparation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/stoptap-v571-live-feed-fix.yml').read_text().splitlines()
+          blocks = []
+          i = 0
+          while i < len(source):
+              line = source[i]
+              if line.startswith('      - name: Build APK'):
+                  break
+              if line == '        run: |':
+                  i += 1
+                  block = []
+                  while i < len(source):
+                      current = source[i]
+                      if current.startswith('      - name:'):
+                          break
+                      if current.startswith('          '):
+                          block.append(current[10:])
+                      elif current.strip() == '':
+                          block.append('')
+                      i += 1
+                  blocks.append('\n'.join(block))
+                  continue
+              i += 1
+
+          if len(blocks) < 5:
+              raise SystemExit(f'Expected the stable workflow run blocks, found only {len(blocks)}')
+
+          out = ['set -euo pipefail']
+          for n, block in enumerate(blocks, 1):
+              out.append(f'echo "=== Stable preparation block {n}/{len(blocks)} ==="')
+              out.append(block)
+              out.append('if [ -f "$GITHUB_ENV" ]; then set -a; . "$GITHUB_ENV"; set +a; fi')
+
+          Path('/tmp/replay-v571.sh').write_text('\n\n'.join(out) + '\n')
+          print(f'Replaying {len(blocks)} stable v5.7.1 preparation blocks')
+          PY
+
+          bash /tmp/replay-v571.sh
+
+      - name: Upgrade compact widget to live arrivals
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['PROJECT_DIR'])
+          java_dir = root / 'app' / 'src' / 'main' / 'java' / 'au' / 'com' / 'stoptap' / 'app'
+
+          gradle_path = root / 'app' / 'build.gradle'
+          gradle = gradle_path.read_text()
+          gradle = gradle.replace('versionCode 8', 'versionCode 9')
+          gradle = gradle.replace("versionName '5.7.1-alpha'", "versionName '5.8-alpha'")
+          gradle_path.write_text(gradle)
+
+          html_path = root / 'app' / 'src' / 'main' / 'assets' / 'index.html'
+          html = html_path.read_text()
+          html = html.replace('v5.7.1 · live feed fix', 'v5.8 · live widget')
+          html_path.write_text(html)
+
+          (java_dir / 'StopTapWidget.java').write_text(r'''package au.com.stoptap.app;
+
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.SystemClock;
+          import android.widget.RemoteViews;
+
+          import com.google.transit.realtime.GtfsRealtime;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          public class StopTapWidget extends AppWidgetProvider {
+              public static final String ACTION_REFRESH = "au.com.stoptap.app.REFRESH_WIDGET";
+              private static final String FEED_URL =
+                      "https://gtfs.adelaidemetro.com.au/v1/realtime/trip_updates";
+              private static final long TICK_MS = 60_000L;
+              private static final long NETWORK_MAX_AGE_MS = 4 * 60_000L;
+              private static JSONObject tripMeta;
+
+              static class Arrival {
+                  final long epoch;
+                  final String route;
+                  Arrival(long epoch, String route) {
+                      this.epoch = epoch;
+                      this.route = route;
+                  }
+              }
+
+              @Override
+              public void onEnabled(Context context) {
+                  super.onEnabled(context);
+                  scheduleTicks(context);
+              }
+
+              @Override
+              public void onDisabled(Context context) {
+                  cancelTicks(context);
+                  super.onDisabled(context);
+              }
+
+              @Override
+              public void onUpdate(Context context, AppWidgetManager manager, int[] ids) {
+                  scheduleTicks(context);
+                  for (int id : ids) renderCached(context, manager, id);
+                  requestRefresh(context, AppWidgetManager.INVALID_APPWIDGET_ID);
+              }
+
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (ACTION_REFRESH.equals(intent.getAction())) {
+                      final PendingResult pending = goAsync();
+                      final Context app = context.getApplicationContext();
+                      final int requestedId = intent.getIntExtra(
+                              AppWidgetManager.EXTRA_APPWIDGET_ID,
+                              AppWidgetManager.INVALID_APPWIDGET_ID
+                      );
+
+                      new Thread(() -> {
+                          try {
+                              AppWidgetManager manager = AppWidgetManager.getInstance(app);
+                              int[] ids;
+                              if (requestedId != AppWidgetManager.INVALID_APPWIDGET_ID) {
+                                  ids = new int[]{requestedId};
+                              } else {
+                                  ids = manager.getAppWidgetIds(
+                                          new ComponentName(app, StopTapWidget.class)
+                                  );
+                              }
+                              for (int id : ids) refreshOne(app, manager, id);
+                          } finally {
+                              pending.finish();
+                          }
+                      }, "StopTap-widget-live").start();
+                      return;
+                  }
+                  super.onReceive(context, intent);
+              }
+
+              private static void scheduleTicks(Context context) {
+                  AlarmManager alarm = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarm == null) return;
+                  Intent intent = new Intent(context, StopTapWidget.class).setAction(ACTION_REFRESH);
+                  PendingIntent pi = PendingIntent.getBroadcast(
+                          context,
+                          5800,
+                          intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+                  alarm.cancel(pi);
+                  alarm.setInexactRepeating(
+                          AlarmManager.ELAPSED_REALTIME,
+                          SystemClock.elapsedRealtime() + TICK_MS,
+                          TICK_MS,
+                          pi
+                  );
+              }
+
+              private static void cancelTicks(Context context) {
+                  AlarmManager alarm = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarm == null) return;
+                  PendingIntent pi = PendingIntent.getBroadcast(
+                          context,
+                          5800,
+                          new Intent(context, StopTapWidget.class).setAction(ACTION_REFRESH),
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+                  alarm.cancel(pi);
+              }
+
+              private static void requestRefresh(Context context, int widgetId) {
+                  Intent intent = new Intent(context, StopTapWidget.class).setAction(ACTION_REFRESH);
+                  if (widgetId != AppWidgetManager.INVALID_APPWIDGET_ID) {
+                      intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
+                  }
+                  context.sendBroadcast(intent);
+              }
+
+              private static String routeJson(Context context, int widgetId) {
+                  SharedPreferences prefs = context.getSharedPreferences("stoptap", Context.MODE_PRIVATE);
+                  String json = prefs.getString("widget_route_" + widgetId, null);
+                  if (json == null) json = prefs.getString("latest_route", null);
+                  return json;
+              }
+
+              private static String routeName(String json) {
+                  if (json == null) return "StopTap";
+                  try { return new JSONObject(json).optString("name", "StopTap"); }
+                  catch (Exception ignored) { return "StopTap"; }
+              }
+
+              private static void renderCached(Context context, AppWidgetManager manager, int widgetId) {
+                  String json = routeJson(context, widgetId);
+                  RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.stoptap_widget);
+                  views.setTextViewText(R.id.route_name, routeName(json));
+
+                  SharedPreferences prefs = context.getSharedPreferences("stoptap", Context.MODE_PRIVATE);
+                  String route = prefs.getString("widget_live_route_" + widgetId, "");
+                  long epoch = prefs.getLong("widget_live_epoch_" + widgetId, 0L);
+                  String line = liveLine(route, epoch);
+                  if (line.isEmpty()) line = "Updating…";
+                  views.setTextViewText(R.id.widget_status, line);
+
+                  attachOpenIntent(context, views, widgetId);
+                  manager.updateAppWidget(widgetId, views);
+              }
+
+              private static String liveLine(String route, long epoch) {
+                  if (route == null || route.isEmpty() || epoch <= 0L) return "";
+                  long seconds = epoch - (System.currentTimeMillis() / 1000L);
+                  if (seconds < -60L) return "";
+                  String when;
+                  if (seconds <= 30L) {
+                      when = "Due";
+                  } else {
+                      int mins = Math.max(1, (int) Math.ceil(seconds / 60.0));
+                      when = mins == 1 ? "1 min" : mins + " min";
+                  }
+                  return route + " · " + when;
+              }
+
+              private static void refreshOne(Context context, AppWidgetManager manager, int widgetId) {
+                  String json = routeJson(context, widgetId);
+                  if (json == null) {
+                      renderCached(context, manager, widgetId);
+                      return;
+                  }
+
+                  String stopId = "";
+                  String stopCode = "";
+                  try {
+                      JSONObject route = new JSONObject(json);
+                      JSONArray from = route.optJSONArray("from");
+                      if (from != null && from.length() > 0) {
+                          JSONObject stop = from.getJSONObject(0);
+                          stopId = stop.optString("id", "");
+                          stopCode = stop.optString("code", "");
+                          if (stopId.isEmpty()) stopId = stopCode;
+                      }
+                  } catch (Exception ignored) {}
+
+                  if (stopId.isEmpty() && stopCode.isEmpty()) {
+                      renderCached(context, manager, widgetId);
+                      return;
+                  }
+
+                  SharedPreferences prefs = context.getSharedPreferences("stoptap", Context.MODE_PRIVATE);
+                  long nowMs = System.currentTimeMillis();
+                  long fetchedAt = prefs.getLong("widget_live_fetched_" + widgetId, 0L);
+                  long cachedEpoch = prefs.getLong("widget_live_epoch_" + widgetId, 0L);
+
+                  boolean cacheUsable = cachedEpoch > (nowMs / 1000L) + 30L
+                          && nowMs - fetchedAt < NETWORK_MAX_AGE_MS;
+
+                  if (cacheUsable) {
+                      renderCached(context, manager, widgetId);
+                      return;
+                  }
+
+                  try {
+                      Arrival arrival = fetchFirstArrival(context, stopId, stopCode);
+                      SharedPreferences.Editor edit = prefs.edit();
+                      if (arrival != null) {
+                          edit.putString("widget_live_route_" + widgetId, arrival.route);
+                          edit.putLong("widget_live_epoch_" + widgetId, arrival.epoch);
+                      } else {
+                          edit.remove("widget_live_route_" + widgetId);
+                          edit.remove("widget_live_epoch_" + widgetId);
+                      }
+                      edit.putLong("widget_live_fetched_" + widgetId, nowMs).apply();
+                  } catch (Exception ignored) {
+                      // Keep the last good prediction if the network/feed is briefly unavailable.
+                  }
+
+                  renderCached(context, manager, widgetId);
+              }
+
+              private static Arrival fetchFirstArrival(
+                      Context context,
+                      String stopId,
+                      String stopCode
+              ) throws Exception {
+                  HttpURLConnection connection = (HttpURLConnection) new URL(FEED_URL).openConnection();
+                  connection.setConnectTimeout(10000);
+                  connection.setReadTimeout(15000);
+                  connection.setRequestMethod("GET");
+                  connection.setRequestProperty("Accept", "application/x-google-protobuf");
+                  connection.setRequestProperty("User-Agent", "StopTap-Android/5.8");
+                  connection.setRequestProperty("Accept-Encoding", "identity");
+
+                  int http = connection.getResponseCode();
+                  if (http != HttpURLConnection.HTTP_OK) {
+                      connection.disconnect();
+                      throw new Exception("HTTP " + http);
+                  }
+
+                  GtfsRealtime.FeedMessage feed;
+                  try (InputStream input = connection.getInputStream()) {
+                      feed = GtfsRealtime.FeedMessage.parseFrom(input);
+                  } finally {
+                      connection.disconnect();
+                  }
+
+                  long now = System.currentTimeMillis() / 1000L;
+                  Arrival best = null;
+                  JSONObject meta = loadTripMeta(context);
+
+                  for (GtfsRealtime.FeedEntity entity : feed.getEntityList()) {
+                      if (!entity.hasTripUpdate()) continue;
+                      GtfsRealtime.TripUpdate update = entity.getTripUpdate();
+                      String tripId = update.getTrip().getTripId();
+                      String routeId = update.getTrip().getRouteId();
+
+                      for (GtfsRealtime.TripUpdate.StopTimeUpdate stu : update.getStopTimeUpdateList()) {
+                          if (!stu.hasStopId()) continue;
+                          String liveStop = stu.getStopId();
+                          boolean match = (!stopId.isEmpty() && stopId.equals(liveStop))
+                                  || (!stopCode.isEmpty() && stopCode.equals(liveStop));
+                          if (!match) continue;
+
+                          long epoch = 0L;
+                          if (stu.hasArrival() && stu.getArrival().hasTime()) {
+                              epoch = stu.getArrival().getTime();
+                          } else if (stu.hasDeparture() && stu.getDeparture().hasTime()) {
+                              epoch = stu.getDeparture().getTime();
+                          }
+                          if (epoch <= 0L) continue;
+                          long away = epoch - now;
+                          if (away < -60L || away > 7200L) continue;
+
+                          String label = routeId == null ? "" : routeId.trim();
+                          String mapping = meta.optString(tripId, "");
+                          if (!mapping.isEmpty()) {
+                              int tab = mapping.indexOf('\t');
+                              label = (tab >= 0 ? mapping.substring(0, tab) : mapping).trim();
+                          }
+                          if (label.isEmpty()) label = "Bus";
+
+                          if (best == null || epoch < best.epoch) {
+                              best = new Arrival(epoch, label);
+                          }
+                          break;
+                      }
+                  }
+                  return best;
+              }
+
+              private static synchronized JSONObject loadTripMeta(Context context) {
+                  if (tripMeta != null) return tripMeta;
+                  try (
+                          InputStream in = context.getAssets().open("trip_meta.json");
+                          BufferedReader reader = new BufferedReader(new InputStreamReader(in))
+                  ) {
+                      StringBuilder text = new StringBuilder();
+                      String line;
+                      while ((line = reader.readLine()) != null) text.append(line);
+                      tripMeta = new JSONObject(text.toString());
+                  } catch (Exception ignored) {
+                      tripMeta = new JSONObject();
+                  }
+                  return tripMeta;
+              }
+
+              private static void attachOpenIntent(Context context, RemoteViews views, int widgetId) {
+                  Intent open = new Intent(context, TripNowActivity.class);
+                  open.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
+                  open.setData(Uri.parse("stoptap://trip/" + widgetId));
+                  PendingIntent pi = PendingIntent.getActivity(
+                          context,
+                          widgetId + 10000,
+                          open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+                  views.setOnClickPendingIntent(R.id.widget_root, pi);
+                  views.setOnClickPendingIntent(R.id.route_name, pi);
+                  views.setOnClickPendingIntent(R.id.widget_status, pi);
+                  views.setOnClickPendingIntent(R.id.open_button, pi);
+              }
+          }
+          ''')
+
+          trip_now = java_dir / 'TripNowActivity.java'
+          text = trip_now.read_text()
+          needle = '                  statusView.setText(out.toString());'
+          replacement = '''                  statusView.setText(out.toString());
+
+                  if (widgetId != AppWidgetManager.INVALID_APPWIDGET_ID && !arrivals.isEmpty()) {
+                      Arrival first = arrivals.get(0);
+                      getSharedPreferences("stoptap", Context.MODE_PRIVATE)
+                              .edit()
+                              .putString("widget_live_route_" + widgetId, first.route)
+                              .putLong("widget_live_epoch_" + widgetId, first.epoch)
+                              .putLong("widget_live_fetched_" + widgetId, System.currentTimeMillis())
+                              .apply();
+
+                      Intent widgetRefresh = new Intent(this, StopTapWidget.class)
+                              .setAction(StopTapWidget.ACTION_REFRESH)
+                              .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
+                      sendBroadcast(widgetRefresh);
+                  }'''
+          if needle not in text:
+              raise SystemExit('Could not find Trip Now render point for widget sync')
+          trip_now.write_text(text.replace(needle, replacement, 1))
+
+          print('v5.8 patch installed: compact widget now shows the next live service countdown.')
+          PY
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StopTap-v5.8-live-widget-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
